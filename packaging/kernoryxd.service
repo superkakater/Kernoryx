@@ -1,0 +1,22 @@
+[Unit]
+Description=Kernoryx adaptive laptop power manager
+After=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/kernoryxd
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=kernoryx
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
