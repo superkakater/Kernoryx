@@ -1,4 +1,8 @@
-#include "./sysfs.hpp"
+#include "power.hpp"
+#include "process.hpp"
+#ifndef KX_POWERPROFILESCTL
+#define KX_POWERPROFILESCTL "/usr/bin/powerprofilesctl"
+#endif
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -8,64 +12,23 @@
 #include <cmath>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/wait.h>
 using namespace std;
 
 namespace kx {
 
-    string read(const filesystem::path &path) {
-        ifstream file(path);
-        string s;
-        if (!file || !getline(file, s)) {
-            throw runtime_error("Failed to read from " + path.string());
-        }
-        while (!s.empty() && (s.back() == '\r' || s.back() == ' ')) {
-            s.pop_back();
-        }
-        return s;
-    }
-
-    void write(const filesystem::path &path, const string &value) {
-        ofstream file(path);
-        if (!file || !(file << value << '\n') || !file.flush()) {
-            throw runtime_error("Failed to write to " + path.string());
-        }
-    }
-
-    vector<string> words(const string &value) {
-        istringstream stream(value);
-        vector<string> result;
-        string word;
-        while (stream >> word) {
-            result.push_back(word);
-        }
-        return result;
-    }
+    // constexpr string to_string(Mode m) {
+    //     switch (m) {
+    //         case Mode::Eco: return "eco";
+    //         case Mode::Balanced: return "balanced";
+    //         case Mode::Performance: return "performance";
+    //         case Mode::Beast: return "beast";
+    //         default: return "unknown";
+    //     }
+    // }
 
     static bool has(const string &list, const string &item) {
         const auto w = words(list);
         return find(w.begin(), w.end(), item) != w.end();
-    }
-
-    double boottime() {
-        timespec t;
-        if (clock_gettime(CLOCK_BOOTTIME, &t)) {
-            throw runtime_error("CLOCK_BOOTTIME failed");
-        }
-        return double(t.tv_sec) + double(t.tv_nsec) / 1e9;
-    }
-
-    long duration(const string &s) {
-        if (!regex_match(s, regex("[1-9][0-9]{0,5}[smh]"))) {
-            throw runtime_error("Duration must be 1s..2h (s, m, h suffix)");
-        }
-        long n = stol(s.substr(0, s.size() - 1));
-        n *= s.back() == 'h' ? 3600 : s.back() =='m' ? 60 : 1;
-
-        if (n > 7200) {
-            throw runtime_error("Maximum lease is 2h");
-        }
-        return n;
     }
 
     Decision Policy::evaluate(const string &requested, Telemetry t, double now) {
@@ -82,7 +45,9 @@ namespace kx {
         if (!t.temperature || !t.ac || *t.temperature >= 85) {
             throttled = true;
             coolSince = -1;
-            return {"balanced", !t.temperature ? "CPU temperature unavailable" : !t.ac ? "AC not detected" : "CPU temperature is at or above 85 C"};
+            return {"balanced", !t.temperature ? "CPU temperature unavailable"
+                                : !t.ac        ? "AC not detected"
+                                               : "CPU temperature is at or above 85 C"};
         }
         if (throttled) {
             if (*t.temperature <= 80) {
@@ -103,18 +68,18 @@ namespace kx {
         return {requested, "AC and thermal headroom available"};
     }
 
-    static vector<filesystem::path> entries(const filesystem::path &p) {
-        vector<filesystem::path> result;
-        if (filesystem::exists(p)) {
-            for (const auto &entry : filesystem::directory_iterator(p)) {
-                result.push_back(entry.path());
-            }
+    Backend::Backend(filesystem::path path) : root(std::move(path)) {
+        if (root == "/sys" && filesystem::exists(KX_POWERPROFILESCTL)) {
+            auto probe = execute({KX_POWERPROFILESCTL, "get"});
+            delegated = probe.code == 0 &&
+                        (probe.output == "power-saver" || probe.output == "balanced" || probe.output == "performance");
         }
-        sort(result.begin(), result.end());
-        return result;
     }
 
     vector<string> Backend::keys() const {
+        if (delegated) {
+            return {"service/power-profile"};
+        }
         vector<string> result;
         auto add = [&](const string &p) {
             if (filesystem::exists(root / p)) {
@@ -122,24 +87,38 @@ namespace kx {
             }
         };
         add("firmware/acpi/platform_profile");
-        for (const auto &p : entries(root / "divices/system/cpu/cpu0/cpufreq")) {
-            if (!regex_match(p.filename().string(), regex("policy[0-9]+")))
+        for (const auto &p : entries(root / "devices/system/cpu/cpufreq")) {
+            if (!regex_match(p.filename().string(), regex("policy[0-9]+"))) {
                 continue;
-            if (!filesystem::exists(p / "scaling_driver") || read(p / "scaling_driver") != "intel_pstate")
+            }
+            if (!filesystem::exists(p / "scaling_driver") || read(p / "scaling_driver") != "intel_pstate") {
                 continue;
-            if (!filesystem::exists(p / "energy_performance_preference"))
+            }
+            if (!filesystem::exists(p / "energy_performance_preference")) {
                 continue;
+            }
             auto rel = p.lexically_relative(root).string();
-            add(rel + "/scaling_driver");
+            add(rel + "/scaling_governor");
             add(rel + "/energy_performance_preference");
         }
-        if (filesystem::exists(root / "devices/system/cpu/intel_pstate/status") && read(root / "devices/system/cpu/intel_pstate/status") == "active") {
+        if (filesystem::exists(root / "devices/system/cpu/intel_pstate/status") &&
+            read(root / "devices/system/cpu/intel_pstate/status") == "active") {
             add("devices/system/cpu/intel_pstate/no_turbo");
         }
         return result;
     }
 
     string Backend::get(const string &key) const {
+        if (delegated) {
+            if (key != "service/power-profile") {
+                throw runtime_error("Invalid service key");
+            }
+            auto r = execute({KX_POWERPROFILESCTL, "get"});
+            if (r.code || (r.output != "power-saver" && r.output != "balanced" && r.output != "performance")) {
+                throw runtime_error("Power profile service unavailable: " + r.output);
+            }
+            return r.output;
+        }
         return read(root / key);
     }
 
@@ -155,12 +134,23 @@ namespace kx {
         if (mode != "eco" && mode != "balanced" && mode != "performance" && mode != "beast") {
             throw runtime_error("Invalid mode: " + mode);
         }
+        if (delegated) {
+            const string profile = mode == "eco" ? "power-saver" : mode == "balanced" ? "balanced" : "performance";
+            auto r = execute({KX_POWERPROFILESCTL, "list"});
+            if (r.code || r.output.find(profile + ":") == string::npos) {
+                throw runtime_error("System service does not offer profile: " + profile);
+            }
+            return {{"service/power-profile", profile}};
+        }
         string_map result;
         for (const auto &k : keys()) {
             const auto p = root / k;
             if (p.filename() == "platform_profile") {
                 const auto available = read(root / "firmware/acpi/platform_profile_choices");
-                const vector<string> candidates = mode == "eco" ? vector<string>{"low-power", "quiet", "balanced"} : mode == "balanced" ? vector<string>{"balanced"} : vector<string>{"performance", "balanced-performance", "balanced"};
+                const vector<string> candidates =
+                    mode == "eco"        ? vector<string>{"low-power", "quiet", "balanced"}
+                    : mode == "balanced" ? vector<string>{"balanced"}
+                                         : vector<string>{"performance", "balanced-performance", "balanced"};
                 for (const auto &v : candidates) {
                     if (has(available, v)) {
                         result[k] = v;
@@ -173,7 +163,10 @@ namespace kx {
                 }
                 result[k] = "powersave";
             } else if (p.filename() == "energy_performance_preference") {
-                const string v = mode == "eco" ? "power" : mode == "balanced" ? "balance_power" : mode == "performance" ? "balance_performance" : "performance";
+                const string v = mode == "eco"           ? "power"
+                                 : mode == "balanced"    ? "balance_power"
+                                 : mode == "performance" ? "balance_performance"
+                                                         : "performance";
                 if (!has(read(p.parent_path() / "energy_performance_available_preferences"), v)) {
                     throw runtime_error("Required EPP unavailable: " + v);
                 }
@@ -202,9 +195,26 @@ namespace kx {
     }
 
     void Backend::apply(const string_map &target) const {
+        if (delegated) {
+            for (const auto &[k, v] : target) {
+                if (k != "service/power-profile" || (v != "power-saver" && v != "balanced" && v != "performance")) {
+                    throw runtime_error("Invalid service profile");
+                }
+                if (get(k) != v) {
+                    auto r = execute({KX_POWERPROFILESCTL, "set", v});
+                    if (r.code) {
+                        throw runtime_error("System profile change failed: " + r.output);
+                    }
+                }
+                if (get(k) != v) {
+                    throw runtime_error("System profile readback mismatch");
+                }
+            }
+            return;
+        }
         const auto supported = keys();
         vector<pair<string, string>> sorted(target.begin(), target.end());
-        stable_sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b){
+        stable_sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) {
             return priority(a.first) < priority(b.first);
         });
         for (const auto &[k, v] : sorted) {
@@ -232,39 +242,13 @@ namespace kx {
     }
 
     Telemetry Backend::telemetry() const {
-        Telemetry t;
-        for (const auto &p : entries(root / "class/power_supply")) {
-            try {
-                if (filesystem::exists(p / "online") && read(p / "type") != "Battery" && read(p / "online") == "1") {
-                    t.ac = true;
-                }
-            } catch (...) {}
-        }
-        for (const auto &p : entries(root / "class/hwmon")) {
-            try {
-                const auto name = read(p / "name");
-                if (name != "coretemp" && name != "k10temp") {
-                    continue;
-                }
-                for (const auto &sensor : entries(p)) {
-                    if (regex_match(sensor.filename().string(), regex("temp[0-9]+_input"))) {
-                        try {
-                            const auto raw  = read(sensor);
-                            size_t used = 0;
-                            double v = stod(raw, &used) / 1000.0;
-                            if (used == raw.size() && isfinite(v) && v > 0 && v < 150) {
-                                t.temperature = max(t.temperature.value_or(v), v);
-                            }
-                        } catch (...) {}
-                    }
-                }
-            } catch (...) {}
-        }
-        return t;
+        return readTelemetry(root);
     }
 
     string Backend::describe() const {
         ostringstream s;
+        s << "Power backend: "
+          << (delegated ? "system power-profiles API via powerprofilesctl" : "direct sysfs fallback") << "\n";
         s << "Supported control values (missing controls are not emulated):\n";
         for (const auto &[k, v] : snapshot()) {
             s << " " << k << " = " << v << '\n';
@@ -277,11 +261,14 @@ namespace kx {
                 s << mode << ": unavailable: " << e.what() << "\n";
             }
         }
-        s << "CPU backend: acgive intel_pstate + EPP only; other drivers use platform profile only.\n" << "Fan PWM/EC: untouched; cooling policy belongs to firmware.\n";
+        s << "CPU backend: active intel_pstate + EPP only; other drivers use platform profile only.\n"
+          << "Power backend does not write fan controls; see fan status.\n";
         return s.str();
     }
 
-    Controller::Controller(filesystem::path root, filesystem::path state, bool simulation): backend(move(root)), journal(move(state)), simulated(simulation) {}
+    Controller::Controller(filesystem::path root, filesystem::path state, bool simulation)
+        : backend(move(root)), journal(move(state)), simulated(simulation) {
+    }
 
     string Controller::conflicts() const {
         // simulation is for testing
@@ -289,30 +276,24 @@ namespace kx {
             return {};
         }
         string result;
-        for (const char *unit : {"power-profile-daemon.service", "tlp.service", "auto-cpufreq.service", "tuned.service", "tuned-ppd.service", "system76-power.service"}) {
-            const pid_t child = fork();
-            if (child < 0) {
-                throw runtime_error("Cannot check competing services");
+        vector<string> active;
+        for (const char *unit : {"power-profiles-daemon.service", "tlp.service", "auto-cpufreq.service",
+                                 "tuned.service", "tuned-ppd.service", "system76-power.service"}) {
+            auto r = execute({"/usr/bin/systemctl", "is-active", unit});
+            if (r.code == 0) {
+                active.emplace_back(unit);
+            } else if (r.code != 3 && r.code != 4) {
+                throw runtime_error("Cannot query systemd; refusing hardware ownership");
             }
-            if (!child) {
-                int null = open("/dev/null", O_RDWR);
-                dup2(null, 1);
-                dup2(null, 2);
-                execl("/usr/bin/systemctl", "systemctl", "is-active", "--quiet", unit, static_cast<char*>(nullptr));
-                _exit(127);
+        }
+        bool tunedCompat = find(active.begin(), active.end(), "tuned-ppd.service") != active.end();
+        for (const auto &unit : active) {
+            if (backend.usesSystemService() &&
+                (unit == "power-profiles-daemon.service" ||
+                 (tunedCompat && (unit == "tuned.service" || unit == "tuned-ppd.service")))) {
+                continue;
             }
-            int status = 0;
-            while (waitpid(child, &status, 0) < 0) {
-                if (errno != EINTR) {
-                    throw runtime_error("waitpid failed");
-                }
-            }
-            if (!WIFEXITED(status) || WEXITSTATUS(status) == 127 || WEXITSTATUS(status) == 1) {
-                runtime_error("Cannot query systemd; refusing hardware ownership");
-            }
-            if (WEXITSTATUS(status) == 0) {
-                result += string(unit) + " ";
-            }
+            result += unit + " ";
         }
         return result;
     }
@@ -323,34 +304,10 @@ namespace kx {
         for (const auto &[k, v] : baseline) {
             auto old = expected.find(k);
             auto next = intended.find(k);
-            s << quoted(k) << ' ' << quoted(v) << ' ' << quoted(old == expected.end() ? v : old->second) << ' ' << quoted(next == intended.end() ? v : next->second) << endl; 
+            s << quoted(k) << ' ' << quoted(v) << ' ' << quoted(old == expected.end() ? v : old->second) << ' '
+              << quoted(next == intended.end() ? v : next->second) << endl;
         }
-        const auto tmp = journal.string() + ".tmp";
-        int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
-        if (fd < 0) {
-            throw runtime_error("Cannot create rollback journal");
-        }
-        const auto bytes = s.str();
-        size_t done = 0;
-        while (done < bytes.size()) {
-            auto n = ::write(fd, bytes.data() + done, bytes.size() - done);
-            if (n <= 0) {
-                close(fd);
-                throw runtime_error("Journal write failed");
-            }
-            done += size_t(n);
-        }
-        if (fsync(fd)) {
-            close(fd);
-            throw runtime_error("Journal sync failed");
-        }
-        close(fd);
-        filesystem::rename(tmp, journal);
-        int dir = open(journal.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-        if (dir >= 0) {
-            fsync(dir);
-            close(dir);
-        }
+        saveState(journal, s.str());
     }
 
     void Controller::recover() {
@@ -367,7 +324,7 @@ namespace kx {
         string_map restore;
         while (getline(in, line)) {
             istringstream row(line);
-            if (!(row >> quoted(k) >> quoted(k) >> quoted(old) >> quoted(next))) {
+            if (!(row >> quoted(k) >> quoted(v) >> quoted(old) >> quoted(next))) {
                 throw runtime_error("Malformed recovery journal");
             }
             row >> ws;
@@ -380,7 +337,7 @@ namespace kx {
             }
             auto actual = backend.get(k);
             if (actual != old && actual != next && actual != v) {
-                throw runtime_error("Recoevry conflict; journal retained: " + k);
+                throw runtime_error("Recovery conflict; journal retained: " + k);
             }
             restore[k] = v;
         }
@@ -392,7 +349,7 @@ namespace kx {
         }
         backend.apply(restore);
         filesystem::remove(journal);
-        cerr << "Recovered original settings after interrupted session" << endl; 
+        cerr << "Recovered original settings after interrupted session" << endl;
     }
 
     void Controller::transition(const string_map &target) {
@@ -419,7 +376,7 @@ namespace kx {
             return;
         }
         if (backend.snapshot() != expected || !conflicts().empty()) {
-            requested = effective = "external-charge";
+            requested = effective = "external-change";
             deadline = 0;
             reason = "Hardware changed externally; automatic writes suspended. mode release to relinquish.";
             throw runtime_error(reason);
@@ -439,7 +396,6 @@ namespace kx {
         if (policy.critical) {
             requested = "eco";
             deadline = 0;
-            leaseBase.clear();
         }
         if (effective != decision.mode) {
             transition(backend.plan(decision.mode));
@@ -449,8 +405,11 @@ namespace kx {
     }
 
     string Controller::set(const string &mode, long seconds, bool replace, bool dry) {
+        if (seconds < 0 || seconds > 7200) {
+            throw runtime_error("Invalid lease duration");
+        }
         backend.plan(mode);
-        if (mode == "beast" && ! seconds) {
+        if (mode == "beast" && !seconds) {
             seconds = 1800;
         }
         if (deadline && !replace) {
@@ -473,7 +432,7 @@ namespace kx {
         auto target = backend.plan(decision.mode);
         ostringstream out;
         out << (dry ? "DRY RUN: " : "APPLIED: ") << mode << " ->" << decision.mode << " (" << decision.reason << ")\n";
-        for (const auto &[k,v] : target) {
+        for (const auto &[k, v] : target) {
             out << " " << k << " = " << v << endl;
         }
         if (dry) {
@@ -496,11 +455,7 @@ namespace kx {
             throw;
         }
         if (seconds && !deadline) {
-            leaseBase = before;
             priorRequested = requested;
-        }
-        if (!seconds) {
-            leaseBase.clear();
         }
         requested = candidate.critical ? "eco" : mode;
         effective = decision.mode;
@@ -530,7 +485,6 @@ namespace kx {
         policy = nextPolicy;
         reason = "Lease restored: " + decision.reason;
         deadline = 0;
-        leaseBase.clear();
         ++generation;
     }
 
@@ -546,7 +500,6 @@ namespace kx {
         }
         baseline.clear();
         expected.clear();
-        leaseBase.clear();
         filesystem::remove(journal);
         requested = effective = "unmanaged";
         deadline = 0;
@@ -557,17 +510,19 @@ namespace kx {
     string Controller::status() const {
         auto t = backend.telemetry();
         ostringstream s;
-        s << "Kernoryx 0.1.0 power example" << (simulated ? " [SIMULATION]" : "") << '\n'
+        s << "Kernoryx 0.3.0" << (simulated ? " [SIMULATION]" : "") << '\n'
           << "Requested: " << requested << "\nEffective policy: " << effective << "\nReason: " << reason
           << "\nAC: " << (t.ac ? "online" : "absent/unknown") << "\nCPU hottest: ";
-        if (t.temperature)
+        if (t.temperature) {
             s << *t.temperature << " C";
-        else
+        } else {
             s << "unavailable";
+        }
         s << "\nLease remaining: " << (deadline ? std::max(0L, long(std::ceil(deadline - boottime()))) : 0)
-          << " s\nGeneration: " << generation << "\nFan: no override requested; firmware policy retained\n";
-        for (const auto &[k, v] : backend.snapshot())
+          << " s\nGeneration: " << generation << "\n";
+        for (const auto &[k, v] : backend.snapshot()) {
             s << k << " = " << v << '\n';
+        }
         return s.str();
     }
-}
+} // namespace kx

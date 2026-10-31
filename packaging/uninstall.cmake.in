@@ -1,0 +1,14 @@
+# Leave configuration, journals and user-created workflow/timer files intact.
+set(paths
+    "@CMAKE_INSTALL_PREFIX@/bin/kernoryx"
+    "@CMAKE_INSTALL_PREFIX@/sbin/kernoryxd"
+    "@CMAKE_INSTALL_PREFIX@/libexec/kernoryx/maintenance.py"
+    "@CMAKE_INSTALL_PREFIX@/lib/systemd/system/kernoryxd.service"
+)
+foreach(path IN LISTS paths)
+    set(target "$ENV{DESTDIR}${path}")
+    if(EXISTS "${target}" OR IS_SYMLINK "${target}")
+        message(STATUS "Removing ${target}")
+        file(REMOVE "${target}")
+    endif()
+endforeach()

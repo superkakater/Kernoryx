@@ -1,20 +1,14 @@
 #pragma once
-#include <filesystem>
+#include "system.hpp"
 #include <map>
-#include <optional>
 #include <string>
 #include <vector>
-#include <string_view>
 using namespace std;
 
 namespace kx {
     using string_map = map<string, string>;
-    struct Telemetry {
-        optional<double> temperature;
-        bool ac= false;
-    };
     struct Decision {
-        string mode; 
+        string mode;
         string reason;
     };
 
@@ -24,29 +18,28 @@ namespace kx {
         double coolSince = -1;
         Decision evaluate(const string &requested, Telemetry t, double now);
     };
-    string read(const filesystem::path &path);
-    void write(const filesystem::path &path, const string &value);
-    double boottime();
-    long duration(const string &value);
-    vector<string> words(const string &value);
-
     // Backend is used for translating modes into linux controls
     class Backend {
         filesystem::path root;
-        public:
-            explicit Backend(filesystem::path root = "/sys") : root(std::move(root)) {};
-            vector<string> keys() const;
-            string_map snapshot() const;
-            string_map plan(const string &mode) const;
-            Telemetry telemetry() const;
-            string describe() const;
-            string get(const string &key) const;
-            void apply(const string_map &target) const;
+        bool delegated = false;
+
+    public:
+        explicit Backend(filesystem::path root = "/sys");
+        bool usesSystemService() const {
+            return delegated;
+        }
+        vector<string> keys() const;
+        string_map snapshot() const;
+        string_map plan(const string &mode) const;
+        Telemetry telemetry() const;
+        string describe() const;
+        string get(const string &key) const;
+        void apply(const string_map &target) const;
     };
     struct Controller {
         Backend backend;
         filesystem::path journal;
-        string_map baseline, expected, leaseBase;
+        string_map baseline, expected;
         Policy policy;
         string requested = "unmanaged", effective = "unmanaged", reason = "No mode selected";
         string priorRequested = "unmanaged";
@@ -65,4 +58,4 @@ namespace kx {
         string status() const;
         string conflicts() const;
     };
-}
+} // namespace kx

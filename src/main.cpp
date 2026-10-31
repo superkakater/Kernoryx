@@ -2,26 +2,54 @@
 #include <stdexcept>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <filesystem>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 using namespace std;
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     try {
+        if (argc > 1 && (string(argv[1]) == "memory" || string(argv[1]) == "cleanup" || string(argv[1]) == "workflow" ||
+                         string(argv[1]) == "schedule")) {
+            // Python isolated mode ignores user site packages and PYTHON* environment.
+            string helper = KX_HELPER;
+            if (filesystem::canonical("/proc/self/exe") == filesystem::path(KX_BUILD_BINARY)) {
+                helper = KX_BUILD_HELPER;
+            }
+            vector<char *> command{const_cast<char *>("/usr/bin/python3"), const_cast<char *>("-I"), helper.data()};
+            for (int i = 1; i < argc; ++i) {
+                command.push_back(argv[i]);
+            }
+            command.push_back(nullptr);
+            execv(command[0], command.data());
+            throw runtime_error("Cannot run installed maintenance helper");
+        }
         if (argc == 1 || (argc == 2 && string(argv[1]) == "--help")) {
-            cout << "Kernoryx power module" << endl
-                << "    kernoryx status | doctor | mode status | modes list" << endl
-                << "    kernoryx mode set eco | balanced | performance | beast [--for 30m] [--replace] [--dry-run]" << endl
-                << "    kernoryx mode restore       Restore the active lease's prior mode" << endl
-                << "    kernoryx mode release       Restore startup snapshot and relinquish ownership" << endl
-                << "    kernoryx --version" << endl
-                << "    kernoryx --socket PATH COMMAND      Connect to simulation socket" << endl
-                << "Beast defaults to 30m; all leases are at most 2h. Real mutations require sudo." << endl;
+            cout << "Kernoryx system orchestration" << endl
+                 << "    kernoryx status | doctor | mode status | mode list" << endl
+                 << "    kernoryx mode set eco | balanced | performance | beast [--for 30m] [--replace] [--dry-run]"
+                 << endl
+                 << "    kernoryx mode restore       Restore the active lease's prior mode" << endl
+                 << "    kernoryx mode release       Restore startup snapshot and relinquish ownership" << endl
+                 << "    kernoryx thermal status | fan status | fan auto | fan boost [--for 60s] [--replace] "
+                    "[--experimental] [--dry-run]"
+                 << endl
+                 << "    kernoryx fan restore | fan release (release performs no hardware write)" << endl
+                 << "    IdeaPad 83AL: experimental firmware mode 4, then restore Standard (1); maximum 10m." << endl
+                 << "    fan auto is ThinkPad-only. IdeaPad has no documented auto mode." << endl
+                 << "    kernoryx memory status | memory reclaim CGROUP AMOUNT [--dry-run]" << endl
+                 << "    kernoryx cleanup scan|run PROVIDER [--days 30] [--keep 3] [--path PATH] [--apply]" << endl
+                 << "    kernoryx workflow validate|run FILE [--apply]" << endl
+                 << "    kernoryx schedule --help" << endl
+                 << "    kernoryx --version" << endl
+                 << "    kernoryx --socket PATH COMMAND      Connect to simulation socket" << endl
+                 << "Beast defaults to 30m; all leases are at most 2h. Real mutations require sudo." << endl;
             return 0;
         }
         if (argc == 2 && string(argv[1]) == "--version") {
-            cout << "Kernoryx 0.1.0" << endl;
+            cout << "Kernoryx 0.3.0" << endl;
             return 0;
         }
         string path = "/run/kernoryx/control.sock";
@@ -58,7 +86,8 @@ int main(int argc, char** argv) {
         }
         ucred cred{};
         socklen_t length = sizeof(cred);
-        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &length) || (path == "/run/kernoryx/control.sock" && cred.uid != 0)) {
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &length) ||
+            (path == "/run/kernoryx/control.sock" && cred.uid != 0)) {
             throw runtime_error("Untrusted daemon credentials");
         }
         if (send(fd, request.data(), request.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(request.size())) {

@@ -1,4 +1,5 @@
-#include "sysfs.hpp"
+#include "power.hpp"
+#include "health.hpp"
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
@@ -13,15 +14,20 @@
 #include <unistd.h>
 using namespace std;
 
-static volatile __sig_atomic_t stopping = 0;
-static void stop(int) { stopping = 1; }
-static string dispatch(kx::Controller &c, const string &line, bool authorized) {
+static volatile sig_atomic_t stopping = 0;
+static void stop(int) {
+    stopping = 1;
+}
+static string dispatch(kx::Controller &c, kx::Health &h, const string &line, bool authorized) {
     const auto args = kx::words(line);
+    if (!args.empty() && (args[0] == "fan" || args[0] == "thermal")) {
+        return h.command(args, authorized);
+    }
     if (args == vector<string>{"status"} || args == vector<string>{"mode", "status"}) {
-        return c.status();
+        return c.status() + (args[0] == "status" ? h.status() : "");
     }
     if (args == vector<string>{"doctor"}) {
-        return c.status() + c.backend.describe() + "Competing services: " + c.conflicts() + "\n";
+        return c.status() + h.status() + c.backend.describe() + "Competing services: " + c.conflicts() + "\n";
     }
     if (args == vector<string>{"mode", "list"}) {
         string out;
@@ -74,12 +80,13 @@ static string dispatch(kx::Controller &c, const string &line, bool authorized) {
 int main(int argc, char **argv) {
     try {
         bool simulated = false;
-        filesystem::path root = "/sys", run = "run/kernoryx";
+        filesystem::path root = "/sys", run = "/run/kernoryx";
         if (argc == 5 && string(argv[1]) == "--simulate" && string(argv[3]) == "--runtime") {
             simulated = true;
             root = filesystem::canonical(argv[2]);
             run = filesystem::absolute(argv[4]);
-            if (root == "/" || root.string().starts_with("/") || root.string().starts_with("/proc") || root.string().starts_with("/dev")) {
+            if (root == "/" || root == "/sys" || root.string().starts_with("/sys/") ||
+                root.string().starts_with("/proc") || root.string().starts_with("/dev")) {
                 throw runtime_error("Simulation needs a regular fixture directory");
             }
             for (auto const &e : filesystem::recursive_directory_iterator(root)) {
@@ -95,7 +102,7 @@ int main(int argc, char **argv) {
         }
         umask(0077);
         if (!filesystem::exists(run)) {
-            filesystem::create_directory(run);
+            filesystem::create_directories(run);
         }
         struct stat st{};
         if (lstat(run.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0022)) {
@@ -106,9 +113,15 @@ int main(int argc, char **argv) {
         if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB)) {
             throw runtime_error("Another daemon holds the runtime lock");
         }
-        kx::Controller controller(root, run / "rollback", simulated);
+        filesystem::path state = simulated ? run : filesystem::path("/var/lib/kernoryx");
+        filesystem::create_directories(state);
+        if (lstat(state.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0022)) {
+            throw runtime_error("State directory must be owned by daemon user and not group/world-writable");
+        }
+        kx::Controller controller(root, state / "rollback", simulated);
+        kx::Health health(root, state / "fan-rollback");
         controller.recover();
-        int server = socket(AF_UNIX, SOCK_SEQPACKET |  SOCK_CLOEXEC, 0);
+        int server = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
         if (server < 0) {
             throw runtime_error(string("socket failed: ") + strerror(errno));
         }
@@ -121,7 +134,7 @@ int main(int argc, char **argv) {
         strcpy(addr.sun_path, path.c_str());
         unlink(path.c_str());
         if (bind(server, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) || listen(server, 16)) {
-            throw runtime_error("Socket path too long");
+            throw runtime_error(string("Cannot bind/listen on socket: ") + strerror(errno));
         }
         chmod(path.c_str(), simulated ? 0600 : 0666);
         signal(SIGINT, stop);
@@ -133,6 +146,11 @@ int main(int argc, char **argv) {
         while (!stopping) {
             const auto now = kx::boottime();
             if (now >= nextTick) {
+                try {
+                    health.tick(now);
+                } catch (const exception &e) {
+                    cerr << "Fan guard: " << e.what() << endl;
+                }
                 try {
                     controller.tick(now);
                     lastError.clear();
@@ -179,7 +197,8 @@ int main(int argc, char **argv) {
                         throw runtime_error("Invalid request character");
                     }
                 }
-                response = "OK\n" + dispatch(controller, request, cred.uid == 0 || (simulated && cred.uid == geteuid()));
+                response = "OK\n" +
+                           dispatch(controller, health, request, cred.uid == 0 || (simulated && cred.uid == geteuid()));
             } catch (const exception &e) {
                 response = string("ERR\n") + e.what() + '\n';
             }
@@ -189,11 +208,24 @@ int main(int argc, char **argv) {
             send(client, response.data(), response.size(), MSG_NOSIGNAL);
             close(client);
         }
-        controller.release();
+        // Attempt both restorations even if one subsystem is unavailable.
+        bool restored = true;
+        try {
+            health.release();
+        } catch (const exception &error) {
+            cerr << "Fan shutdown recovery pending: " << error.what() << endl;
+            restored = false;
+        }
+        try {
+            controller.release();
+        } catch (const exception &error) {
+            cerr << "Power shutdown recovery pending: " << error.what() << endl;
+            restored = false;
+        }
         close(server);
         unlink(path.c_str());
         close(lock);
-        return 0;
+        return restored ? 0 : 1;
     } catch (const exception &e) {
         cerr << "kernoryxd: " << e.what() << endl;
         return 1;

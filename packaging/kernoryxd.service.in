@@ -1,12 +1,14 @@
 [Unit]
-Description=Kernoryx adaptive laptop power manager
+Description=Kernoryx power sessions and thermal monitoring
 After=dbus.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/kernoryxd
+ExecStart=@CMAKE_INSTALL_PREFIX@/sbin/kernoryxd
 Restart=on-failure
 RestartSec=2
+StateDirectory=kernoryx
+StateDirectoryMode=0700
 RuntimeDirectory=kernoryx
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes

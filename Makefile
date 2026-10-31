@@ -1,27 +1,30 @@
-CXX ?= g++
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic
-CPPFLAGS += -Iinclude
+CMAKE ?= cmake
+CTEST ?= ctest
+BUILD_DIR ?= build
+BUILD_TYPE ?= Debug
 PREFIX ?= /usr/local
-all: build/kernoryx build/kernoryxd
-build:
-	mkdir -p build
-build/kernoryx: src/main.cpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< -o $@
-build/kernoryxd: src/daemon.cpp src/sysfs.cpp src/sysfs.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) src/daemon.cpp src/sysfs.cpp -o $@
-build/policy-test: tests/policy.cpp src/sysfs.cpp src/sysfs.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/policy.cpp src/sysfs.cpp -o $@
-build/controller-test: tests/controller.cpp src/power.cpp src/sysfs.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tests/controller.cpp src/sysfs.cpp -o $@
-test: all build/policy-test build/controller-test
-	./build/policy-test
-	./build/controller-test
-	python3 tests/integration.py
-install: all
-	install -Dm755 build/kernoryx $(DESTDIR)$(PREFIX)/bin/kernoryx
-	install -Dm755 build/kernoryxd $(DESTDIR)$(PREFIX)/sbin/kernoryxd
-	install -d $(DESTDIR)/etc/systemd/system
-	sed 's|/usr/local|$(PREFIX)|g' packaging/kernoryxd.service > $(DESTDIR)/etc/systemd/system/kernoryxd.service
+JOBS ?= 2
+.DEFAULT_GOAL := all
+configure:
+	$(CMAKE) -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" -DCMAKE_INSTALL_PREFIX="$(PREFIX)"
+all: configure
+	$(CMAKE) --build "$(BUILD_DIR)" --parallel "$(JOBS)"
+test: all
+	$(CTEST) --test-dir "$(BUILD_DIR)" --output-on-failure
+install:
+	@test -f "$(BUILD_DIR)/kernoryx" -a -f "$(BUILD_DIR)/kernoryxd" || { echo "Run make before installing."; exit 1; }
+	$(CMAKE) --install "$(BUILD_DIR)"
+uninstall:
+	$(CMAKE) -P "$(BUILD_DIR)/uninstall.cmake"
 clean:
-	rm -rf build
-.PHONY: all test install clean
+	@test "$(BUILD_DIR)" != "/" -a "$(BUILD_DIR)" != "." -a -n "$(BUILD_DIR)"
+	$(CMAKE) -E rm -rf "$(BUILD_DIR)"
+help:
+	@echo "make                  Configure and build (JOBS=2, BUILD_TYPE=Debug)"
+	@echo "make test             Build and run all tests"
+	@echo "sudo make install     Install already-built files; no compilation"
+	@echo "sudo make uninstall   Remove installed files; preserve runtime state/workflows"
+	@echo "make clean            Remove the selected build directory"
+	@echo "Overrides: BUILD_DIR=build PREFIX=/usr/local JOBS=4 BUILD_TYPE=Release"
+	@echo "Installation does not enable/reload services; see README.md."
+.PHONY: configure all test install uninstall clean help
